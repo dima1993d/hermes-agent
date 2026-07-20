@@ -463,6 +463,21 @@ def _session_chat_run_policy(
     return policy, None
 
 
+def _run_policy_history_error(
+    policy: Dict[str, Any], history: List[Dict[str, Any]],
+) -> Optional["web.Response"]:
+    """Keep a persisted session's tool schema and budget stable after turn one."""
+    if not policy or not history:
+        return None
+    return web.json_response(
+        _openai_error(
+            "Per-run policy is only accepted before a session's first message",
+            code="run_policy_locked",
+        ),
+        status=409,
+    )
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -2565,6 +2580,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if err is not None:
             return err
         history = await self._conversation_history_for_session(session_id)
+        policy_error = _run_policy_history_error(run_policy, history)
+        if policy_error is not None:
+            return policy_error
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -2610,6 +2628,10 @@ class APIServerAdapter(BasePlatformAdapter):
         run_policy, err = _session_chat_run_policy(body)
         if err is not None:
             return err
+        history = await self._conversation_history_for_session(session_id)
+        policy_error = _run_policy_history_error(run_policy, history)
+        if policy_error is not None:
+            return policy_error
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -2655,7 +2677,6 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = await self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,

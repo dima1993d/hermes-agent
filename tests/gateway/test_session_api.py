@@ -386,6 +386,29 @@ async def test_session_chat_rejects_invalid_run_policy_before_agent_start(adapte
 
 
 @pytest.mark.asyncio
+async def test_session_chat_rejects_policy_change_after_first_message(adapter, session_db):
+    session_id = session_db.create_session("locked-policy-session", "api_server")
+    app = _create_session_app(adapter)
+    run_agent = AsyncMock()
+    history = [{"role": "user", "content": "earlier turn"}]
+
+    with (
+        patch.object(adapter, "_run_agent", run_agent),
+        patch.object(adapter, "_conversation_history_for_session", return_value=history),
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "continue", "max_iterations": 4},
+            )
+            assert resp.status == 409
+            payload = await resp.json()
+
+    assert payload["error"]["code"] == "run_policy_locked"
+    run_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter, session_db):
     """run.completed must include the full interleaved turn transcript so a
     client that lost intermediate (pre-tool-call) assistant text from the live
