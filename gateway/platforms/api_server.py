@@ -125,6 +125,9 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_REQUEST_TOOLSETS = 64
+MAX_REQUEST_ITERATIONS = 200
+_TOOLSET_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -394,6 +397,70 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return _normalize_multimodal_content(user_message), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
+
+
+def _session_chat_run_policy(
+    body: Dict[str, Any],
+) -> tuple[Dict[str, Any], Optional["web.Response"]]:
+    """Validate optional per-turn limits for trusted session API clients.
+
+    These values can only narrow the gateway's configured policy. The agent
+    factory intersects requested toolsets with the platform's enabled set and
+    clamps the iteration override to the configured global maximum.
+    """
+    policy: Dict[str, Any] = {}
+
+    if "max_iterations" in body:
+        value = body.get("max_iterations")
+        if isinstance(value, bool) or not isinstance(value, int):
+            return {}, web.json_response(
+                _openai_error(
+                    "max_iterations must be an integer",
+                    param="max_iterations",
+                    code="invalid_max_iterations",
+                ),
+                status=400,
+            )
+        if not 1 <= value <= MAX_REQUEST_ITERATIONS:
+            return {}, web.json_response(
+                _openai_error(
+                    f"max_iterations must be between 1 and {MAX_REQUEST_ITERATIONS}",
+                    param="max_iterations",
+                    code="invalid_max_iterations",
+                ),
+                status=400,
+            )
+        policy["max_iterations_override"] = value
+
+    if "enabled_toolsets" in body:
+        values = body.get("enabled_toolsets")
+        if not isinstance(values, list) or len(values) > MAX_REQUEST_TOOLSETS:
+            return {}, web.json_response(
+                _openai_error(
+                    f"enabled_toolsets must be a list of at most {MAX_REQUEST_TOOLSETS} names",
+                    param="enabled_toolsets",
+                    code="invalid_enabled_toolsets",
+                ),
+                status=400,
+            )
+        normalized: List[str] = []
+        seen = set()
+        for value in values:
+            if not isinstance(value, str) or not _TOOLSET_NAME_RE.fullmatch(value):
+                return {}, web.json_response(
+                    _openai_error(
+                        "enabled_toolsets contains an invalid name",
+                        param="enabled_toolsets",
+                        code="invalid_enabled_toolsets",
+                    ),
+                    status=400,
+                )
+            if value not in seen:
+                seen.add(value)
+                normalized.append(value)
+        policy["enabled_toolsets_override"] = normalized
+
+    return policy, None
 
 
 def check_api_server_requirements() -> bool:
@@ -1754,6 +1821,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        max_iterations_override: Optional[int] = None,
+        enabled_toolsets_override: Optional[List[str]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1848,8 +1917,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if enabled_toolsets_override is not None:
+            platform_enabled = set(enabled_toolsets)
+            enabled_toolsets = [
+                name for name in enabled_toolsets_override if name in platform_enabled
+            ]
 
         max_iterations = _current_max_iterations()
+        if max_iterations_override is not None:
+            max_iterations = min(max_iterations, max_iterations_override)
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -2485,6 +2561,9 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        run_policy, err = _session_chat_run_policy(body)
+        if err is not None:
+            return err
         history = await self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -2492,6 +2571,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            **run_policy,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2527,6 +2607,9 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        run_policy, err = _session_chat_run_policy(body)
+        if err is not None:
+            return err
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -2581,6 +2664,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    **run_policy,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -4632,6 +4716,8 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
+        max_iterations_override: Optional[int] = None,
+        enabled_toolsets_override: Optional[List[str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4673,6 +4759,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         tool_complete_callback=tool_complete_callback,
                         gateway_session_key=gateway_session_key,
                         route=route,
+                        max_iterations_override=max_iterations_override,
+                        enabled_toolsets_override=enabled_toolsets_override,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
