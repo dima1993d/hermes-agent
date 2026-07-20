@@ -367,6 +367,74 @@ async def test_session_chat_stream_forwards_narrowing_run_policy(adapter, sessio
 
 
 @pytest.mark.asyncio
+async def test_session_chat_reapplies_persisted_policy_on_later_turns(adapter, session_db):
+    session_id = session_db.create_session("persistent-policy-session", "api_server")
+    captured = []
+
+    async def fake_run(**kwargs):
+        captured.append(kwargs)
+        return {"final_response": "ok", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={
+                    "message": "first",
+                    "max_iterations": 7,
+                    "enabled_toolsets": ["safe", "web"],
+                },
+            )
+            assert first.status == 200, await first.text()
+
+            fetched = await cli.get(f"/api/sessions/{session_id}")
+            assert fetched.status == 200
+            assert (await fetched.json())["session"]["has_run_policy"] is True
+
+            with patch.object(
+                adapter,
+                "_conversation_history_for_session",
+                return_value=[{"role": "user", "content": "first"}],
+            ):
+                second = await cli.post(
+                    f"/api/sessions/{session_id}/chat/stream",
+                    json={"message": "second"},
+                )
+                assert second.status == 200, await second.text()
+
+    assert len(captured) == 2
+    assert captured[1]["max_iterations_override"] == 7
+    assert captured[1]["enabled_toolsets_override"] == ["safe", "web"]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_change_to_persisted_policy(adapter, session_db):
+    session_id = session_db.create_session("changed-policy-session", "api_server")
+
+    async def fake_run(**kwargs):
+        return {"final_response": "ok", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run) as run_agent:
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "first", "enabled_toolsets": ["safe"]},
+            )
+            assert first.status == 200, await first.text()
+            changed = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "second", "enabled_toolsets": ["web"]},
+            )
+            assert changed.status == 409
+            payload = await changed.json()
+
+    assert payload["error"]["code"] == "run_policy_locked"
+    assert run_agent.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_session_chat_rejects_invalid_run_policy_before_agent_start(adapter, session_db):
     session_id = session_db.create_session("invalid-policy-session", "api_server")
     app = _create_session_app(adapter)

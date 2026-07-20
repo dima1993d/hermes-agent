@@ -2278,6 +2278,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
+        payload["has_run_policy"] = bool(session.get("run_policy_json"))
         return payload
 
     @staticmethod
@@ -2320,6 +2321,72 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
+
+    async def _effective_session_run_policy(
+        self,
+        session_id: str,
+        requested: Dict[str, Any],
+        history: List[Dict[str, Any]],
+        session: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], Optional["web.Response"]]:
+        """Claim once, then reapply a session API policy on every turn."""
+
+        stored_raw = session.get("run_policy_json")
+        stored: Dict[str, Any] = {}
+        if stored_raw:
+            try:
+                candidate = json.loads(stored_raw)
+                if not isinstance(candidate, dict):
+                    raise ValueError("run policy is not an object")
+                stored = candidate
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.error("Session %s has an invalid persisted run policy", session_id)
+                return {}, web.json_response(
+                    _openai_error(
+                        "Persisted session run policy is invalid",
+                        code="invalid_persisted_run_policy",
+                    ),
+                    status=500,
+                )
+
+        if stored:
+            if requested and requested != stored:
+                return {}, web.json_response(
+                    _openai_error(
+                        "Per-run policy cannot change after a session's first turn",
+                        code="run_policy_locked",
+                    ),
+                    status=409,
+                )
+            return stored, None
+
+        policy_error = _run_policy_history_error(requested, history)
+        if policy_error is not None:
+            return {}, policy_error
+        if not requested:
+            return {}, None
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return {}, web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+        canonical = json.dumps(requested, sort_keys=True, separators=(",", ":"))
+        claimed_raw = await asyncio.to_thread(
+            db.claim_session_run_policy,
+            session_id,
+            canonical,
+        )
+        if claimed_raw != canonical:
+            return {}, web.json_response(
+                _openai_error(
+                    "Per-run policy cannot change after a session's first turn",
+                    code="run_policy_locked",
+                ),
+                status=409,
+            )
+        return requested, None
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
@@ -2564,7 +2631,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        session_record, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -2580,7 +2647,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if err is not None:
             return err
         history = await self._conversation_history_for_session(session_id)
-        policy_error = _run_policy_history_error(run_policy, history)
+        run_policy, policy_error = await self._effective_session_run_policy(
+            session_id, run_policy, history, session_record,
+        )
         if policy_error is not None:
             return policy_error
         result, usage = await self._run_agent(
@@ -2613,7 +2682,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        session_record, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -2629,7 +2698,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if err is not None:
             return err
         history = await self._conversation_history_for_session(session_id)
-        policy_error = _run_policy_history_error(run_policy, history)
+        run_policy, policy_error = await self._effective_session_run_policy(
+            session_id, run_policy, history, session_record,
+        )
         if policy_error is not None:
             return policy_error
 

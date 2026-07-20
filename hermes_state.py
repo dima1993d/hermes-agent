@@ -772,6 +772,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     expiry_finalized INTEGER DEFAULT 0,
     model TEXT,
     model_config TEXT,
+    run_policy_json TEXT,
     system_prompt TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
@@ -2784,6 +2785,36 @@ class SessionDB:
                 (model_config_json, model, session_id),
             )
         self._execute_write(_do)
+
+    def claim_session_run_policy(
+        self,
+        session_id: str,
+        run_policy_json: str,
+    ) -> Optional[str]:
+        """Atomically set a session's immutable API run policy if still unset.
+
+        Returns the stored value, which may belong to a concurrent first turn.
+        Session API callers compare it with their requested canonical policy so
+        two racing requests cannot silently choose different tool surfaces.
+        """
+        if not session_id or not run_policy_json:
+            return None
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET run_policy_json = ? "
+                "WHERE id = ? AND run_policy_json IS NULL",
+                (run_policy_json, session_id),
+            )
+            row = conn.execute(
+                "SELECT run_policy_json FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return row["run_policy_json"] if isinstance(row, sqlite3.Row) else row[0]
+
+        return self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
